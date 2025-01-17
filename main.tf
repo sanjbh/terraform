@@ -34,6 +34,42 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
+
+resource "aws_launch_configuration" "public" {
+  image_id        = "ami-0df8c184d5f6ae949"
+  instance_type   = var.instance_type
+  security_groups = [aws_security_group.instance.id]
+
+  user_data = <<-EOF
+    #!/bin/sh
+    dnf update -y
+    dnf install -y httpd
+    systemctl start httpd
+    systemctl enable httpd
+    echo "<h1>Hello from Terraform-provisioned EC2 Web Server!</h1>" > /var/www/html/index.html
+  EOF
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_autoscaling_group" "public" {
+  launch_configuration = aws_launch_configuration.public.id
+  min_size             = 2
+  max_size             = 10
+
+  tag {
+    key                 = "Name"
+    value               = "terraform-asg-example"
+    propagate_at_launch = true
+  }
+
+  vpc_zone_identifier = [aws_subnet.public.id]
+  target_group_arns   = [aws_lb_target_group.asg.arn]
+  health_check_type   = "ELB"
+}
+
 resource "aws_instance" "example" {
   ami                    = "ami-0df8c184d5f6ae949"
   instance_type          = var.instance_type
@@ -43,9 +79,10 @@ resource "aws_instance" "example" {
   user_data = <<-EOF
     #!/bin/sh
     dnf update -y
-    dnf install -y busybox
-    echo "Hello, world" > index.xhtml
-    nohup busybox httpd -f -p ${var.server_port} &
+    dnf install -y httpd
+    systemctl start httpd
+    systemctl enable httpd
+    echo "<h1>Hello from Terraform-provisioned EC2 Web Server!</h1>" > /var/www/html/index.html
   EOF
 
   user_data_replace_on_change = true
@@ -84,4 +121,77 @@ resource "aws_security_group" "instance" {
 resource "aws_key_pair" "terraform-example-key" {
   key_name   = "terraform-example-key"
   public_key = file("~/.ssh/id_ed25519.pub")
+}
+
+
+resource "aws_lb" "example" {
+  name               = "terraform-asg-example"
+  load_balancer_type = "application"
+  subnets            = [aws_subnet.public.id]
+  security_groups    = [aws_security_group.alb.id]
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.example.arn
+  port              = 80
+  protocol          = "http"
+
+  default_action {
+    type = "fixed-response"
+
+    fixed_response {
+      content_type = "text/plain"
+      message_body = "404: page not found"
+      status_code  = 404
+    }
+  }
+}
+
+resource "aws_security_group" "alb" {
+  name = "terraform-example-alb"
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+resource "aws_lb_target_group" "asg" {
+  name     = "terraform-asg-example"
+  port     = var.server_port
+  protocol = "http"
+  vpc_id   = aws_vpc.main.id
+
+  health_check {
+    path                = "/"
+    protocol            = "http"
+    matcher             = "200"
+    interval            = 15
+    timeout             = 3
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_listener_rule" "asg" {
+  listener_arn = aws_lb_listener.http.arn
+  condition {
+    path_pattern {
+      values = ["*"]
+    }
+  }
+
+  action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.asg.arn
+  }
 }
